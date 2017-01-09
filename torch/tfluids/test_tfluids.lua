@@ -32,6 +32,7 @@ local mytester = torch.Tester()
 local test = torch.TestSuite()
 local times = {}
 local profileTimeSec = 1
+local jac = nn.Jacobian
 
 function test.MoveImpulseWithinImage2D()
   local methods = {'euler', 'rk2'}
@@ -595,6 +596,67 @@ function test.setObstacleBcsCUDA()
   end
 end
 
+function test.VolumetricUpSamplingNearest()
+  local batchSize = torch.random(1, 5)
+  local nPlane = torch.random(1, 5)
+  local widthIn = torch.random(5, 8)
+  local heightIn = torch.random(5, 8)
+  local depthIn = torch.random(5, 8)
+  local ratio = torch.random(1, 3)
+
+  local module = tfluids.VolumetricUpSamplingNearest(ratio)
+
+  local input = torch.rand(batchSize, nPlane, depthIn, heightIn, widthIn)
+  local output = module:forward(input):clone()
+
+  assert(output:dim() == 5)
+  assert(output:size(1) == batchSize)
+  assert(output:size(2) == nPlane)
+  assert(output:size(3) == depthIn * ratio)
+  assert(output:size(4) == heightIn * ratio)
+  assert(output:size(5) == widthIn * ratio)
+
+  local outputGT = torch.Tensor():resizeAs(output)
+  for b = 1, batchSize do
+    for f = 1, nPlane do
+      for z = 1, depthIn * ratio do
+        local zIn = math.floor((z - 1) / ratio) + 1
+        for y = 1, heightIn * ratio do
+          local yIn = math.floor((y - 1) / ratio) + 1
+          for x = 1, widthIn * ratio do
+            local xIn = math.floor((x - 1) / ratio) + 1
+            outputGT[{b, f, z, y, x}] = input[{b, f, zIn, yIn, xIn}]
+          end
+        end
+      end
+    end
+  end
+
+  -- Note FPROP should be exact (it's just a copy).
+  mytester:asserteq((output - outputGT):abs():max(), 0, 'error on fprop')
+
+  -- Generate a valid gradInput (we'll use it to test the GPU implementation).
+  local gradOutput = torch.rand(batchSize, nPlane, depthIn * ratio,
+                                heightIn * ratio, widthIn * ratio);
+  local gradInput = module:backward(input, gradOutput):clone()
+
+  -- Perform the function on the GPU.
+  module:cuda()
+  local outputGPU = module:forward(input:cuda()):double()
+  mytester:assertle((output - outputGPU):abs():max(), precision,
+                    'error on GPU fprop')
+
+  local gradInputGPU =
+      module:backward(input:cuda(), gradOutput:cuda()):double()
+  mytester:assertlt((gradInput - gradInputGPU):abs():max(), precision,
+                    'error on GPU bprop')
+
+  -- Check BPROP is correct.
+  module:double()
+  local err = jac.testJacobian(module, input)
+  mytester:assertlt(err, precision, 'error on bprop')
+end
+
 -- Now run the test above
 mytester:add(test)
 
@@ -614,20 +676,27 @@ function tfluids.test(tests, seed, gpuDevice)
   cutorch.manualSeed(seed)
   mytester:run(tests)
 
-  print ''
-  print('-----------------------------------------------------------------' ..
-        '-------------')
-  print('| Module                                                       ' ..
-        '| Speedup     |')
-  print('-----------------------------------------------------------------' ..
-        '-------------')
-  for module, tm in pairs(times) do
-    local str = string.format('| %-60s | %6.2f      |', module,
-                              (tm.cpu / tm.gpu))
-    print(str)
+  numTimes = 0
+  for _, _ in pairs(times) do
+    numTimes = numTimes + 1
   end
-  print('-----------------------------------------------------------------' ..
-        '-------------')
+
+  if numTimes > 0 then
+    print ''
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+    print('| Module                                                       ' ..
+          '| Speedup     |')
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+    for module, tm in pairs(times) do
+      local str = string.format('| %-60s | %6.2f      |', module,
+                                (tm.cpu / tm.gpu))
+      print(str)
+    end
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+  end
 
   cutorch.setDevice(curDevice)
 

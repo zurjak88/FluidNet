@@ -327,6 +327,8 @@ end
 rawset(tfluids, 'calcVelocityDivergenceBackward',
        calcVelocityDivergenceBackward)
 
+include('volumetric_up_sampling_nearest.lua')
+
 -- Also include the test framework.
 include('test_tfluids.lua')
 

@@ -44,6 +44,11 @@ function torch.defaultConf()
       addPressureSkip = false,
       -- advectionMethod: options are 'euler', 'rk2', 'maccormack'
       advectionMethod = 'rk2',
+      banksJoinStage = 3,  -- Join BEFORE this stage.
+      banksAggregateMethod = 'add',  -- options are 'concat' and 'add'
+      banksNum = 1,  -- Number of parallel resolution banks (1 == disable).
+      banksSplitStage = 1,  -- Split BEFORE this stage.
+      banksWeightShare = true,
       batchNormAffine = true,  -- ignored if addBatchNorm == false.
       batchNormEps = 1e-4,  -- ignored if addBatchNorm == false.
       batchNormMom = 0.1,  -- ignored if addBatchNorm == false.
@@ -88,10 +93,14 @@ function torch.defaultConf()
       -- 'lbfgs' (requires full batch not mini batches)
       modelType = 'default',  -- Choices are 'default', 'yang', 'tog'
       nonlinType = 'relu',  -- Choices are: 'relu', 'relu6', 'sigmoid'.
+      normalizeInput = false,  -- If true, normalize by max(std(chan), thresh)
+      normalizeInputChan = 'UDiv',  -- Which input channel to calculate std.
+      normalizeInputThrehsold = 0.01,  -- Don't normalize input noise.
+      normalizeInputFunc = 'std',  -- Choices are: 'std' or 'norm' (l2).
       optimizationMethod = 'adam',
       optimState = {
         bestPerf = math.huge,
-        learningRate = 0.00025,
+        learningRate = 0.0025,
         weightDecay = 0,  -- L2 regularization parameter
         momentum = 0.9,
         dampening = 0,

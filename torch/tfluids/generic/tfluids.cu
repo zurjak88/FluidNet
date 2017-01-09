@@ -675,10 +675,10 @@ __global__ void kernel_calcVelocityUpdate(
   // Look at the neighbor to the right (pos) and to the left (neg).
   bool geomPos = false;
   bool geomNeg = false;
-  if (pos[dim] == 0) {
+  if (pos[dim] <= 0) {
     geomNeg = true;  // Treat going off the fluid as geometry.
   }
-  if (pos[dim] == size[dim] - 1) {
+  if (pos[dim] >= size[dim] - 1) {
     geomPos = true;  // Treat going off the fluid as geometry. 
   }
   if (pos[dim] > 0) {
@@ -952,10 +952,10 @@ __global__ void kernel_calcVelocityDivergence(
     // Look at the neighbor to the right (pos) and to the left (neg).
     bool geomPos = false;
     bool geomNeg = false;
-    if (pos[dim] == 0) {
+    if (pos[dim] <= 0) {
       geomNeg = true;  // Treat going off the fluid as geometry.
     }
-    if (pos[dim] == size[dim] - 1) {
+    if (pos[dim] >= size[dim] - 1) {
       geomPos = true;  // Treat going off the fluid as geometry. 
     }
     if (pos[dim] > 0) {
@@ -1070,10 +1070,10 @@ __global__ void kernel_calcVelocityDivergenceBackward(
     // Look at the neighbor to the right (pos) and to the left (neg).
     bool geomPos = false;
     bool geomNeg = false;
-    if (pos[dim] == 0) {
+    if (pos[dim] <= 0) {
       geomNeg = true;  // Treat going off the fluid as geometry.
     }
-    if (pos[dim] == size[dim] - 1) {
+    if (pos[dim] >= size[dim] - 1) {
       geomPos = true;  // Treat going off the fluid as geometry. 
     }
     if (pos[dim] > 0) {
@@ -2168,6 +2168,171 @@ static int tfluids_CudaMain_advectVel(lua_State *L) {
   return 0;  
 }
 
+__global__ void kernel_volumetricUpSamplingNearestForward(
+    const int ratio, THCDeviceTensor<float, 5> in,
+    THCDeviceTensor<float, 5> out) {
+  const int pnt_id = threadIdx.x + blockIdx.x * blockDim.x;
+  const int dim = blockIdx.y;
+  const int batch = blockIdx.z;
+  if (pnt_id >= (out.getSize(2) * out.getSize(3) * out.getSize(4))) {
+    return;
+  }
+  const int x = pnt_id % out.getSize(4);
+  const int y = (pnt_id / out.getSize(4)) % out.getSize(3);
+  const int z = pnt_id / (out.getSize(3) * out.getSize(4));
+
+  const int xin = x / ratio;
+  const int yin = y / ratio;
+  const int zin = z / ratio;
+  const float inVal = in[batch][dim][zin][yin][xin];
+  out[batch][dim][z][y][x] = inVal;
+}
+
+static int tfluids_CudaMain_volumetricUpSamplingNearestForward(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THCudaTensor* input = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* output = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+
+  if (input->nDimension != 5 || output->nDimension != 5) {
+    luaL_error(L, "ERROR: input and output must be dim 5");
+  }
+
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (output->size[0] != nbatch || output->size[1] != nfeat ||
+      output->size[2] != zdim * ratio || output->size[3] != ydim * ratio ||
+      output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : output size mismatch.");
+  }
+
+  THCDeviceTensor<float, 5> dev_in = toDeviceTensor<float, 5>(state, input);
+  THCDeviceTensor<float, 5> dev_out = toDeviceTensor<float, 5>(state, output);
+
+  if (!THCudaTensor_isContiguous(state, input)) {
+    luaL_error(L, "ERROR: input must be contiguous");
+  }
+  if (!THCudaTensor_isContiguous(state, output)) {
+    luaL_error(L, "ERROR: output must be contiguous");
+  }
+
+  // One thread per output element.
+  int nplane = dev_out.getSize(2) * dev_out.getSize(3) * dev_out.getSize(4);
+  dim3 grid_size(THCCeilDiv(nplane, 256), dev_out.getSize(1),
+                 dev_out.getSize(0));
+  dim3 block_size(nplane > 256 ? 256 : nplane);
+
+  kernel_volumetricUpSamplingNearestForward<<<grid_size, block_size, 0,
+                                            THCState_getCurrentStream(state)>>>(
+      ratio, dev_in, dev_out);
+
+  return 0;
+}
+
+__global__ void kernel_volumetricUpSamplingNearestBackward(
+    const int ratio, THCDeviceTensor<float, 5> grad_out,
+    THCDeviceTensor<float, 5> grad_in) {
+  const int pnt_id = threadIdx.x + blockIdx.x * blockDim.x;
+  const int dim = blockIdx.y;
+  const int batch = blockIdx.z; 
+  if (pnt_id >= (grad_in.getSize(2) * grad_in.getSize(3) *
+      grad_in.getSize(4))) {
+    return;
+  }
+  const int x = pnt_id % grad_in.getSize(4);
+  const int y = (pnt_id / grad_in.getSize(4)) % grad_in.getSize(3);
+  const int z = pnt_id / (grad_in.getSize(3) * grad_in.getSize(4));
+ 
+  float sum = 0.0f;
+
+  // Now accumulate gradients from the upsampling window.
+  for (int32_t zup = 0; zup < ratio; zup++) { 
+    for (int32_t yup = 0; yup < ratio; yup++) { 
+      for (int32_t xup = 0; xup < ratio; xup++) {
+        const int xin = x * ratio + xup;
+        const int yin = y * ratio + yup;
+        const int zin = z * ratio + zup;
+        const float val = grad_out[batch][dim][zin][yin][xin];
+        sum += val;
+      }
+    }
+  }
+        
+  grad_in[batch][dim][z][y][x] = sum;
+}
+
+static int tfluids_CudaMain_volumetricUpSamplingNearestBackward(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+  
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THCudaTensor* input = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* grad_output = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+  THCudaTensor* grad_input = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 4, "torch.CudaTensor"));
+  
+  if (input->nDimension != 5 || grad_output->nDimension != 5 ||
+      grad_input->nDimension != 5) {
+    luaL_error(L, "ERROR: input, gradOutput and gradInput must be dim 5");
+  }
+  
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (grad_output->size[0] != nbatch || grad_output->size[1] != nfeat ||
+      grad_output->size[2] != zdim * ratio ||
+      grad_output->size[3] != ydim * ratio ||
+      grad_output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : gradOutput size mismatch.");
+  }
+
+  if (grad_input->size[0] != nbatch || grad_input->size[1] != nfeat ||
+      grad_input->size[2] != zdim || grad_input->size[3] != ydim ||
+      grad_input->size[4] != xdim) {
+    luaL_error(L, "ERROR: input : gradInput size mismatch.");
+  }
+
+  THCDeviceTensor<float, 5> dev_in = toDeviceTensor<float, 5>(state, input);
+  THCDeviceTensor<float, 5> dev_grad_out = toDeviceTensor<float, 5>(
+      state, grad_output);
+  THCDeviceTensor<float, 5> dev_grad_in = toDeviceTensor<float, 5>(
+    state, grad_input);
+  
+  if (!THCudaTensor_isContiguous(state, input)) {
+    luaL_error(L, "ERROR: input must be contiguous");
+  }
+  if (!THCudaTensor_isContiguous(state, grad_output)) {
+    luaL_error(L, "ERROR: gradOutput must be contiguous");
+  }
+  if (!THCudaTensor_isContiguous(state, grad_input)) {
+    luaL_error(L, "ERROR: gradInput must be contiguous");
+  }
+
+  // One thread per grad_input element.
+  int nplane = dev_grad_in.getSize(2) * dev_grad_in.getSize(3) *
+    dev_grad_in.getSize(4);
+  dim3 grid_size(THCCeilDiv(nplane, 256), dev_grad_in.getSize(1),
+                 dev_grad_in.getSize(0));  
+  dim3 block_size(nplane > 256 ? 256 : nplane);
+  
+  kernel_volumetricUpSamplingNearestBackward<<<grid_size, block_size, 0,
+                                             THCState_getCurrentStream(state)>>>(
+      ratio, dev_grad_out, dev_grad_in);
+
+  return 0;
+}
+
 //******************************************************************************
 // INIT METHODS
 //******************************************************************************
@@ -2184,6 +2349,10 @@ static const struct luaL_Reg tfluids_CudaMain__ [] = {
   {"solveLinearSystemPCG", tfluids_CudaMain_solveLinearSystemPCG},
   {"advectScalar", tfluids_CudaMain_advectScalar},
   {"advectVel", tfluids_CudaMain_advectVel},
+  {"volumetricUpSamplingNearestForward",
+   tfluids_CudaMain_volumetricUpSamplingNearestForward},
+  {"volumetricUpSamplingNearestBackward",
+   tfluids_CudaMain_volumetricUpSamplingNearestBackward},
   {NULL, NULL}  // NOLINT
 };
 

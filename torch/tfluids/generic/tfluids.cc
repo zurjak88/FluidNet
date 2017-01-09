@@ -1473,10 +1473,10 @@ static inline void tfluids_(Main_calcVelocityUpdateAlongDim)(
   // Look at the neighbor to the right (pos) and to the left (neg).
   bool geomPos = false;
   bool geomNeg = false;
-  if (pos[dim] == 0) {
+  if (pos[dim] <= 0) {
     geomNeg = true;  // Treat going off the fluid as geometry.
   }
-  if (pos[dim] == size[dim] - 1) {
+  if (pos[dim] >= size[dim] - 1) {
     geomPos = true;  // Treat going off the fluid as geometry. 
   }
   if (pos[dim] > 0) {
@@ -1747,10 +1747,10 @@ static inline void tfluids_(Main_calcVelocityDivergenceCell)(
     // Look at the neighbor to the right (pos) and to the left (neg).
     bool geomPos = false;
     bool geomNeg = false;
-    if (pos[dim] == 0) {
+    if (pos[dim] <= 0) {
       geomNeg = true;  // Treat going off the fluid as geometry.
     }
-    if (pos[dim] == size[dim] - 1) {
+    if (pos[dim] >= size[dim] - 1) {
       geomPos = true;  // Treat going off the fluid as geometry. 
     }
     if (pos[dim] > 0) {
@@ -1858,10 +1858,10 @@ static inline void tfluids_(Main_calcVelocityDivergenceCellBackward)(
     // Look at the neighbor to the right (pos) and to the left (neg).
     bool geomPos = false;
     bool geomNeg = false;
-    if (pos[dim] == 0) {
+    if (pos[dim] <= 0) {
       geomNeg = true;  // Treat going off the fluid as geometry.
     }
-    if (pos[dim] == size[dim] - 1) {
+    if (pos[dim] >= size[dim] - 1) {
       geomPos = true;  // Treat going off the fluid as geometry. 
     }
     if (pos[dim] > 0) {
@@ -1951,6 +1951,128 @@ static int tfluids_(Main_calcVelocityDivergenceBackward)(lua_State *L) {
   return 0;
 }
 
+static int tfluids_(Main_volumetricUpSamplingNearestForward)(lua_State *L) {
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THTensor* input =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  THTensor* output =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
+
+  if (input->nDimension != 5 || output->nDimension != 5) {
+    luaL_error(L, "ERROR: input and output must be dim 5");
+  }
+
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (output->size[0] != nbatch || output->size[1] != nfeat ||
+      output->size[2] != zdim * ratio || output->size[3] != ydim * ratio ||
+      output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : output size mismatch.");
+  }
+
+  const real* input_data = THTensor_(data)(input);
+  real* output_data = THTensor_(data)(output);
+
+  int32_t b, f, z, y, x;
+#pragma omp parallel for private(b, f, z, y, x) collapse(5)
+  for (b = 0; b < nbatch; b++) {
+    for (f = 0; f < nfeat; f++) {
+      for (z = 0; z < zdim * ratio; z++) {
+        for (y = 0; y < ydim * ratio; y++) {
+          for (x = 0; x < xdim * ratio; x++) {
+            const int64_t iout = output->stride[0] * b + output->stride[1] * f +
+                output->stride[2] * z +
+                output->stride[3] * y + 
+                output->stride[4] * x;
+            const int64_t iin = input->stride[0] * b + input->stride[1] * f +
+                input->stride[2] * (z / ratio) +
+                input->stride[3] * (y / ratio) +
+                input->stride[4] * (x / ratio);
+            output_data[iout] = input_data[iin];
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static int tfluids_(Main_volumetricUpSamplingNearestBackward)(lua_State *L) {
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THTensor* input =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  THTensor* grad_output =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
+  THTensor* grad_input =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 4, torch_Tensor));
+
+  if (input->nDimension != 5 || grad_output->nDimension != 5 ||
+      grad_input->nDimension != 5) {
+    luaL_error(L, "ERROR: input, gradOutput and gradInput must be dim 5");
+  }
+
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (grad_output->size[0] != nbatch || grad_output->size[1] != nfeat ||
+      grad_output->size[2] != zdim * ratio ||
+      grad_output->size[3] != ydim * ratio ||
+      grad_output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : gradOutput size mismatch.");
+  }
+
+  if (grad_input->size[0] != nbatch || grad_input->size[1] != nfeat ||
+      grad_input->size[2] != zdim || grad_input->size[3] != ydim ||
+      grad_input->size[4] != xdim) {
+    luaL_error(L, "ERROR: input : gradInput size mismatch.");
+  }
+
+  const real* input_data = THTensor_(data)(input);
+  const real* grad_output_data = THTensor_(data)(grad_output);
+  real * grad_input_data = THTensor_(data)(grad_input);
+
+  int32_t b, f, z, y, x;
+#pragma omp parallel for private(b, f, z, y, x) collapse(5)
+  for (b = 0; b < nbatch; b++) {
+    for (f = 0; f < nfeat; f++) {
+      for (z = 0; z < zdim; z++) {
+        for (y = 0; y < ydim; y++) {
+          for (x = 0; x < xdim; x++) {
+            const int64_t iout = grad_input->stride[0] * b +
+                grad_input->stride[1] * f +
+                grad_input->stride[2] * z +
+                grad_input->stride[3] * y +
+                grad_input->stride[4] * x;
+            float sum = static_cast<real>(0);
+            // Now accumulate gradients from the upsampling window.
+            for (int32_t zup = 0; zup < ratio; zup++) {
+              for (int32_t yup = 0; yup < ratio; yup++) {
+                for (int32_t xup = 0; xup < ratio; xup++) {
+                  const int64_t iin = grad_output->stride[0] * b +
+                      grad_output->stride[1] * f +
+                      grad_output->stride[2] * (z * ratio + zup) +
+                      grad_output->stride[3] * (y * ratio + yup) +
+                      grad_output->stride[4] * (x * ratio + xup);
+                  sum += grad_output_data[iin];
+                }
+              }
+            }
+            grad_input_data[iout] = sum;
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 static int tfluids_(Main_solveLinearSystemPCG)(lua_State *L) {
   luaL_error(L, "ERROR: solveLinearSystemPCG not defined for CPU tensors.");
   return 0;
@@ -1971,6 +2093,10 @@ static const struct luaL_Reg tfluids_(Main__) [] = {
   {"calcVelocityDivergenceBackward",
    tfluids_(Main_calcVelocityDivergenceBackward)},
   {"solveLinearSystemPCG", tfluids_(Main_solveLinearSystemPCG)},
+  {"volumetricUpSamplingNearestForward",
+   tfluids_(Main_volumetricUpSamplingNearestForward)},
+  {"volumetricUpSamplingNearestBackward",
+   tfluids_(Main_volumetricUpSamplingNearestBackward)},
   {NULL, NULL}  // NOLINT
 };
 
